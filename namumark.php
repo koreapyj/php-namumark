@@ -592,7 +592,7 @@ class NamuMark {
 				if(self::startsWith($line, $bracket['open'], $j) && $innerstr = $this->bracketParser($line, $nj, $bracket)) {
 					$line = substr($line, 0, $j).$innerstr.substr($line, $nj+1);
 					$line_len = strlen($line);
-					$j=$nj;
+					$j+=strlen($innerstr)-1;
 					break;
 				}
 			}
@@ -619,7 +619,7 @@ class NamuMark {
 		else {
 			$targetUrl = $this->prefix.'/'.rawurlencode($href[0]);
 		}
-		return '<a href="'.$targetUrl.'"'.(!empty($class)?' class="'.$class.'"':'').(!empty($target)?' target="'.$target.'"':'').'>'.(!empty($href[1])?$href[1]:$href[0]).'</a>';
+		return '<a href="'.$targetUrl.'"'.(!empty($class)?' class="'.$class.'"':'').(!empty($target)?' target="'.$target.'"':'').'>'.(!empty($href[1])?$this->formatParser($href[1]):$href[0]).'</a>';
 	}
 
 	private function macroProcessor($text, $type) {
@@ -635,7 +635,7 @@ class NamuMark {
 			case 'footnote':
 				return $this->printFootnote();
 			default:
-				if(self::startsWith($text, 'include') && preg_match('/^include\((.+)\)$/', $text, $include)) {
+				if(self::startsWithi($text, 'include') && preg_match('/^include\((.+)\)$/i', $text, $include)) {
 					return $this->htmlScan($this->WikiPage->getPage($include[1])->text);
 				}
 				elseif(self::startsWith($text, '*') && preg_match('/^\*([^ ]*)([ ].+)?$/', $text, $note)) {
@@ -671,6 +671,11 @@ class NamuMark {
 			case ',,':
 				return '<sub>'.$text.'</sub>';
 			case '{{{':
+				if(self::startsWith($text, '#!html')) {
+					$html = substr($text, 7);
+					$html = htmlspecialchars_decode($html);
+					return $html;
+				}
 				if(preg_match('/^#(?:([A-Fa-f0-9]{3}|[A-Fa-f0-9]{6})|([A-Za-z]+)) (.*)$/', $text, $color)) {
 					if(empty($color[1]) && empty($color[2]))
 						return $text;
@@ -844,6 +849,13 @@ class NamuMark {
 		if(($offset+$len)>strlen($haystack))
 			return false;
 		return $needle == substr($haystack, $offset, $len);
+	}
+
+	private static function startsWithi($haystack, $needle, $offset = 0) {
+		$len = strlen($needle);
+		if(($offset+$len)>strlen($haystack))
+			return false;
+		return strtolower($needle) == strtolower(substr($haystack, $offset, $len));
 	}
 
 	private static function seekEndOfLine($text, $offset=0) {
