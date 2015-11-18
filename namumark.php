@@ -68,12 +68,12 @@ class NamuMark {
 			);
 
 		$this->h_tag = array(
-			array('/^====== (.*) ======$/', 6),
-			array('/^===== (.*) =====$/', 5),
-			array('/^==== (.*) ====$/', 4),
-			array('/^=== (.*) ===$/', 3),
-			array('/^== (.*) ==$/', 2),
-			array('/^= (.*) =$/', 1),
+			array('/^====== (.*) ======/', 6),
+			array('/^===== (.*) =====/', 5),
+			array('/^==== (.*) ====/', 4),
+			array('/^=== (.*) ===/', 3),
+			array('/^== (.*) ==/', 2),
+			array('/^= (.*) =/', 1),
 
 			null
 			);
@@ -83,7 +83,7 @@ class NamuMark {
 				'open'	=> '{{{',
 				'close' => '}}}',
 				'multiline' => true,
-				'processor' => array($this,'renderProcessor'))
+				'processor' => array($this,'renderProcessor')),
 			);
 
 		$this->single_bracket = array(
@@ -92,6 +92,11 @@ class NamuMark {
 				'close' => '}}}',
 				'multiline' => false,
 				'processor' => array($this,'textProcessor')),
+			array(
+				'open'	=> '{{|',
+				'close' => '|}}',
+				'multiline' => false,
+				'processor' => array($this,'closureProcessor')),
 			array(
 				'open'	=> '[[',
 				'close' => ']]',
@@ -139,19 +144,39 @@ class NamuMark {
 				'multiline' => false,
 				'processor' => array($this,'textProcessor'))
 			);
+
+		$this->macro_processors = array();
 		
 		$this->WikiPage = $wtext;
+		$this->imageAsLink = false;
+		$this->wapRender = false;
 
 		$this->toc = array();
 		$this->fn = array();
+		$this->category = array();
+		$this->links = array();
 		$this->fn_cnt = 0;
 		$this->prefix = '';
+		$this->prefix = '';
+		$this->included = false;
+	}
+
+	public function getLinks() {
+		if(empty($this->WikiPage->title))
+			return [];
+
+		if(empty($this->links)) {
+			$this->whtml = htmlspecialchars(@$this->WikiPage->text);
+			$this->whtml = $this->htmlScan($this->whtml);
+		}
+		return $this->links;
 	}
 
 	public function toHtml() {
-		$this->whtml = htmlspecialchars($this->WikiPage->text);
+		if(empty($this->WikiPage->title))
+			return '';
+		$this->whtml = htmlspecialchars(@$this->WikiPage->text);
 		$this->whtml = $this->htmlScan($this->whtml);
-		$this->whtml.= $this->printFootnote();
 		return $this->whtml;
 	}
 
@@ -162,11 +187,12 @@ class NamuMark {
 		$line = '';
 
 		if(self::startsWith($text, '#') && preg_match('/^#(?:redirect|넘겨주기) (.+)$/im', $text, $target)) {
-			header('Location: '.$this->prefix.'/'.rawurlencode($target[1]));
+			array_push($this->links, array('target'=>$target[1], 'type'=>'redirect'));
+			@header('Location: '.$this->prefix.'/'.self::encodeURI($target[1]));
 			return;
 		}
 
-		for($i=0;$i<$len;self::nextChar($text,$i)) {
+		for($i=0;$i<$len && $i>=0;self::nextChar($text,$i)) {
 			$now = self::getChar($text,$i);
 			if($line == '' && $now == ' ' && $list = $this->listParser($text, $i)) {
 				$result .= ''
@@ -216,6 +242,16 @@ class NamuMark {
 		}
 		if($line != '')
 			$result .= $this->lineParser($line);
+
+		$result .= $this->printFootnote();
+
+		if(!empty($this->category)) {
+			$result .= '<div class="wiki-category"><h2>분류</h2><ul>';
+			foreach($this->category as $category) {
+				$result .= '<li>'.$this->linkProcessor(':분류:'.$category.'|'.$category, '[[').'</li>';
+			}
+			$result .= '</div>';
+		}
 		return $result;
 	}
 
@@ -229,7 +265,12 @@ class NamuMark {
 				break;
 			}
 			$i+=4;
-			$innerhtml .= '<p>'.$this->formatParser(substr($text, $i, $eol-$i)).'</p>';
+			$line = $this->formatParser(substr($text, $i, $eol-$i));
+			$line = preg_replace('/^(&gt;)+/', '', $line);
+			if($this->wapRender)
+				$innerhtml .= $line.'<br/>';
+			else
+				$innerhtml .= '<p>'.$line.'</p>';
 		}
 		if(empty($innerhtml))
 			return false;
@@ -239,165 +280,148 @@ class NamuMark {
 	}
 
 	private function tableParser($text, &$offset) {
-		$tableTable = array();
 		$len = strlen($text);
-		$lineStart = $offset;
-		
-		$tableInnerStr = '';
-		$tableStyleList = array();
-		for($i=$offset;$i<$len;$i=self::seekEndOfLine($text, $i)+1) {
-			$now = self::getChar($text,$i);
-			$eol = self::seekEndOfLine($text, $i);
-			if(!self::startsWith($text, '||', $i)) {
-				// table end
-				break;
+		$table = new HTMLElement('table');
+		$table->attributes['class'] = 'wiki-table';
+
+		if(!self::startsWith($text, '||', $offset)) {
+			// caption
+			$caption = new HTMLElement('caption');
+			$dummy=0;
+			$caption->innerHTML = $this->bracketParser($text, $offset, array('open' => '|','close' => '|','multiline' => true, 'strict' => false,'processor' => function($str) { return $this->formatParser($str); }));
+			$table->innerHTML .= $caption->toString();
+			$offset++;
+		}
+
+		for($i=$offset;$i<$len && ((!empty($caption) && $i === $offset) || (substr($text, $i, 2) === '||' && $i+=2));) {
+			if(!preg_match('/\|\|( *?(?:\n|$))/', $text, $match, PREG_OFFSET_CAPTURE, $i) || !isset($match[0]) || !isset($match[0][1]))
+				$rowend = -1;
+			else {
+				$rowend = $match[0][1];
+				$endlen = strlen($match[0][0]);
 			}
-			$line = substr($text, $i, $eol-$i);
-			$td = explode('||', $line);
-			$td_cnt = count($td);
+			if($rowend === -1 || !$row = substr($text, $i, $rowend-$i))
+				break;
+			$i = $rowend+$endlen;
+			$row = explode('||', $row);
 
-			$trInnerStr = '';
+			$tr = new HTMLElement('tr');
 			$simpleColspan = 0;
-			for($j=1;$j<$td_cnt-1;$j++) {
-				$innerstr = htmlspecialchars_decode($td[$j]);
+			foreach($row as $cell) {
+				$td = new HTMLElement('td');
 
-				if($innerstr=='') {
-					$simpleColspan += 1;
-					continue;
-				}
-
-				$tdAttr = $tdStyleList = array();
-
-				if($simpleColspan != 0) {
-					$tdAttr['colspan'] = $simpleColspan+1;
-					$simpleColspan = 0;
-				}
-				while(self::startsWith($innerstr, '<')) {
-					$dummy=0;
-					$prop = $this->bracketParser($innerstr, $dummy, array('open'	=> '<', 'close' => '>','multiline' => false,'processor' => function($str) { return $str; }));
-					$innerstr = substr($innerstr, $dummy+1);
+				$cell = htmlspecialchars_decode($cell);
+				$cell = preg_replace_callback('/<(.+?)>/', function($match) use ($table, $tr, $td) {
+					$prop = $match[1];
 					switch($prop) {
 						case '(':
 							break;
 						case ':':
-							$tdStyleList['text-align'] = 'center';
+							$td->style['text-align'] = 'center';
 							break;
 						case ')':
-							$tdStyleList['text-align'] = 'right';
+							$td->style['text-align'] = 'right';
 							break;
 						default:
-							if(self::startsWith($prop, 'table ')) {
+							if(self::startsWith($prop, 'table')) {
 								$tbprops = explode(' ', $prop);
 								foreach($tbprops as $tbprop) {
 									if(!preg_match('/^([^=]+)=(?|"(.*)"|\'(.*)\'|(.*))$/', $tbprop, $tbprop))
 										continue;
 									switch($tbprop[1]) {
 										case 'align':
+										case 'tablealign':
 											switch($tbprop[2]) {
 												case 'left':
-													$tableStyleList['margin-left'] = null;
-													$tableStyleList['margin-right'] = 'auto';
+#													$table->style['float'] = 'left';
+#													$table->attributes['class'].=' float';
 													break;
 												case 'center':
-													$tableStyleList['margin-left'] = 'auto';
-													$tableStyleList['margin-right'] = 'auto';
+													$table->style['margin-left'] = 'auto';
+													$table->style['margin-right'] = 'auto';
 													break;
 												case 'right':
-													$tableStyleList['margin-left'] = 'auto';
-													$tableStyleList['margin-right'] = null;
+													$table->style['float'] = 'right';
+													$table->attributes['class'].=' float';
 													break;
 											}
 											break;
 										case 'bgcolor':
-											$tableStyleList['background-color'] = $tbprop[2];
+											$table->style['background-color'] = $tbprop[2];
 											break;
 										case 'bordercolor':
-											$tableStyleList['border-color'] = $tbprop[2];
+											$table->style['border-color'] = $tbprop[2];
+											$table->style['border-style'] = 'solid';
 											break;
 										case 'width':
-											$tableStyleList['width'] = $tbprop[2];
+										case 'tablewidth':
+											$table->style['width'] = $tbprop[2];
 											break;
 									}
 								}
 							}
 							elseif(preg_match('/^(\||\-)([0-9]+)$/', $prop, $span)) {
 								if($span[1] == '-') {
-									$tdAttr['colspan'] = $span[2];
+									$td->attributes['colspan'] = $span[2];
 									break;
 								}
 								elseif($span[1] == '|') {
-									$tdAttr['rowspan'] = $span[2];
+									$td->attributes['rowspan'] = $span[2];
 									break;
 								}
 							}
 							elseif(preg_match('/^#(?:([A-Fa-f0-9]{3}|[A-Fa-f0-9]{6})|([A-Za-z]+))$/', $prop, $span)) {
-								$tdStyleList['background-color'] = $span[1]?'#'.$span[1]:$span[2];
+								$td->style['background-color'] = $span[1]?'#'.$span[1]:$span[2];
 								break;
 							}
-							elseif(preg_match('/^([^=]+)=(?|"(.*)"|\'(.*)\'|(.*))$/', $prop, $match)) {
-								switch($match[1]) {
+							elseif(preg_match('/^([^=]+)=(?|"(.*)"|\'(.*)\'|(.*))$/', $prop, $htmlprop)) {
+								switch($htmlprop[1]) {
+									case 'rowbgcolor':
+										$tr->style['background-color'] = $htmlprop[2];
+										break;
 									case 'bgcolor':
-										$tdStyleList['background-color'] = $match[2];
+										$td->style['background-color'] = $htmlprop[2];
 										break;
 									case 'width':
-										$tdStyleList['width'] = $match[2];
+										$td->style['width'] = is_numeric($htmlprop[2])?$htmlprop[2].'px':$htmlprop[2];
 										break;
 									case 'height':
-										$tdStyleList['height'] = $match[2];
+										$td->style['height'] = is_numeric($htmlprop[2])?$htmlprop[2].'px':$htmlprop[2];
 										break;
+									default:
+										return $match[0];
 								}
 							}
+							else {
+								return $match[0];
+							}
 					}
+					return '';
+				}, $cell);
+				$cell = htmlspecialchars($cell);
+
+				$cell = preg_replace('/^ ?(.+) ?$/', '$1', $cell);
+				if($cell=='') {
+					$simpleColspan += 1;
+					continue;
 				}
 
-				if(empty($tdStyleList['text-align'])) {
-					if(preg_match('/^ .* $/', $innerstr)) {
-						$tdStyleList['text-align'] = 'center';
-					}
-					elseif(self::seekEndOfLine($innerstr)>0 && $innerstr[self::seekEndOfLine($innerstr)-1] == ' ') {
-						$tdStyleList['text-align'] = null;
-					}
-					elseif(self::startsWith($innerstr, ' ')) {
-						$tdStyleList['text-align'] = 'right';
-					}
-					else {
-						$tdStyleList['text-align'] = null;
-					}
-				}
-				$innerstr = trim($innerstr);
-				
-				$tdAttr['style'] = '';
-				foreach($tdStyleList as $styleName =>$styleValue) {
-					if(empty($styleValue))
-						continue;
-					$tdAttr['style'] .= $styleName.': '.$styleValue.'; ';
+				if($simpleColspan != 0) {
+					$td->attributes['colspan'] = $simpleColspan+1;
+					$simpleColspan = 0;
 				}
 
-				$tdAttrStr = '';
-				foreach($tdAttr as $propName => $propValue) {
-					if(empty($propValue))
-						continue;
-					$tdAttrStr .= ' '.$propName.'="'.str_replace('"', '\\"', $propValue).'"';
+				$lines = explode("\n", $cell);
+				foreach($lines as $line) {
+					$td->innerHTML .= $this->lineParser($line);
 				}
-				$trInnerStr .= '<td'.$tdAttrStr.'>'.$this->blockParser($innerstr).'</td>';
+
+				$tr->innerHTML .= $td->toString();
 			}
-			$tableInnerStr .= !empty($trInnerStr)?'<tr>'.$trInnerStr.'</tr>':'';
+			$table->innerHTML .= $tr->toString();
 		}
-
-		if(empty($tableInnerStr))
-			return false;
-
-		$tableStyleStr = '';
-		foreach($tableStyleList as $styleName =>$styleValue) {
-			if(empty($styleValue))
-				continue;
-			$tableStyleStr .= $styleName.': '.$styleValue.'; ';
-		}
-
-		$tableAttrStr = ($tableStyleStr?' style="'.$tableStyleStr.'"':'');
-		$result = '<div><table class="wiki-table"'.$tableAttrStr.'>'.$tableInnerStr.'</table></div>';
 		$offset = $i-1;
-		return $result;
+		return $table->toString();
 	}
 
 	private function listParser($text, &$offset) {
@@ -408,6 +432,9 @@ class NamuMark {
 		$quit = false;
 		for($i=$offset;$i<$len;$before=self::nextChar($text,$i)) {
 			$now = self::getChar($text,$i);
+			if($now == "\n" && empty($listTable[0])) {
+					return false;
+			}
 			if($now != ' ') {
 				if($lineStart == $i) {
 					// list end
@@ -508,11 +535,11 @@ class NamuMark {
 		}
 
 		// == Title ==
-		if(self::startsWith($line, '=') && preg_match('/^(=+) (.*) (=+)$/', $line, $match) && $match[1]===$match[3]) {
+		if(self::startsWith($line, '=') && preg_match('/^(=+) (.*) (=+)[ ]*$/', $line, $match) && $match[1]===$match[3]) {
 			$level = strlen($match[1]);
 			$innertext = $this->blockParser($match[2]);
 			$id = $this->tocInsert($this->toc, $innertext, $level);
-			$result .= '<h'.$level.' id="s-'.$id.'"><a href="#toc">'.$id.'</a>. '.$innertext.'</h'.$level.'>';
+			$result .= '<h'.$level.' id="s-'.$id.'"><a name="s-'.$id.'" href="#toc">'.$id.'</a>. '.$innertext.'</h'.$level.'>';
 			$line = '';
 		}
 
@@ -524,32 +551,18 @@ class NamuMark {
 
 		$line = $this->blockParser($line);
 
-		if($line != '')
-			$result .= '<p>'.$line.'</p>';
+		if($line != '') {
+			if($this->wapRender)
+				$result .= $line.'<br/><br/>';
+			else
+				$result .= '<p>'.$line.'</p>';
+		}
 
 		return $result;
 	}
 
 	private function blockParser($block) {
-		$result = '';
-		$block_len = strlen($block);
-		// internal image
-		if(preg_match('/^attachment:([^\/]*\/)?([^ ]+\.(?:jpg|jpeg|png|gif))(?:\?([^ ]+))?(.*)$/', $block, $match)) {
-			$result .= ''
-				.'<img src="//upload.namu.wiki/upload/'.($match[1]?($match[1]=='/'?'':$match[1]):rawurlencode($this->WikiPage->title).'/').$match[2].'">'
-				.'';
-			$block = $match[4];
-		}
-
-		// external image
-		if(preg_match('/^(https?:\/\/[^ ]+\.(jpg|jpeg|png|gif))(?:\?([^ ]+))?(.*)$/', $block, $match)) {
-			$result .= ''
-				.'<img src="'.$match[1].'">'
-				.'';
-			$block = $match[4];
-		}
-		$result .= $this->formatParser($block);
-		return $result;
+		return $this->formatParser($block);
 	}
 
 	private function bracketParser($text, &$now, $bracket) {
@@ -559,6 +572,9 @@ class NamuMark {
 
 		$openlen = strlen($bracket['open']);
 		$closelen = strlen($bracket['close']);
+
+		if(!isset($bracket['strict']))
+			$bracket['strict'] = true;
 
 		for($i=$now;$i<$len;self::nextChar($text,$i)) {
 			if(self::startsWith($text, $bracket['open'], $i) && !($bracket['open']==$bracket['close'] && $cnt>0)) {
@@ -574,7 +590,7 @@ class NamuMark {
 			if($cnt == 0 && $done) {
 				$innerstr = substr($text, $now+$openlen, $i-$now-($openlen+$closelen)+1);
 
-				if((!strlen($innerstr)) ||($bracket['multiline'] && strpos($innerstr, "\n")===false))
+				if(($bracket['strict'] && $bracket['multiline'] && strpos($innerstr, "\n")===false))
 					return false;
 				$result = call_user_func_array($bracket['processor'],array($innerstr, $bracket['open']));
 				$now = $i;
@@ -587,13 +603,91 @@ class NamuMark {
 	private function formatParser($line) {
 		$line_len = strlen($line);
 		for($j=0;$j<$line_len;self::nextChar($line,$j)) {
-			foreach($this->single_bracket as $bracket) {
-				$nj=$j;
-				if(self::startsWith($line, $bracket['open'], $j) && $innerstr = $this->bracketParser($line, $nj, $bracket)) {
-					$line = substr($line, 0, $j).$innerstr.substr($line, $nj+1);
-					$line_len = strlen($line);
-					$j+=strlen($innerstr)-1;
-					break;
+			if(self::startsWith($line, 'http', $j) && preg_match('/(https?:\/\/[^ ]+\.(jpg|jpeg|png|gif))(?:\?([^ ]+))?/i', $line, $match, 0, $j)) {
+				if($this->imageAsLink)
+					$innerstr = '<span class="alternative">[<a class="external" target="_blank" href="'.$match[1].'">image</a>]</span>';
+				else {
+					$paramtxt = '';
+					$csstxt = '';
+					if(!empty($match[3])) {
+						preg_match_all('/[&?]?([^=]+)=([^\&]+)/', htmlspecialchars_decode($match[3]), $param, PREG_SET_ORDER);
+						foreach($param as $pr) {
+							switch($pr[1]) {
+								case 'width':
+									if(preg_match('/^[0-9]+$/', $pr[2]))
+										$csstxt .= 'width: '.$pr[2].'px; ';
+									else
+										$csstxt .= 'width: '.$pr[2].'; ';
+									break;
+								case 'height':
+									if(preg_match('/^[0-9]+$/', $pr[2]))
+										$csstxt .= 'height: '.$pr[2].'px; ';
+									else
+										$csstxt .= 'height: '.$pr[2].'; ';
+									break;
+								case 'align':
+									if($pr[2]!='center')
+										$csstxt .= 'float: '.$pr[2].'; ';
+									break;
+								default:
+									$paramtxt.=' '.$pr[1].'="'.$pr[2].'"';
+							}
+						}
+					}
+					$paramtxt .= ($csstxt!=''?' style="'.$csstxt.'"':'');
+					$innerstr = '<img src="'.$match[1].'"'.$paramtxt.'>';
+				}
+				$line = substr($line, 0, $j).$innerstr.substr($line, $j+strlen($match[0]));
+				$line_len = strlen($line);
+				$j+=strlen($innerstr)-1;
+				continue;
+			}elseif(self::startsWith($line, 'attachment', $j) && preg_match('/attachment:([^\/]*\/)?([^ ]+\.(?:jpg|jpeg|png|gif))(?:\?([^ ]+))?/i', $line, $match, 0, $j)) {
+				if($this->imageAsLink)
+					$innerstr = '<span class="alternative">[<a class="external" target="_blank" href="https://attachment.namu.wiki/'.($match[1]?($match[1]=='' || substr($match[1], 0, -1)==''?'':substr($match[1], 0, -1).'__'):rawurlencode($this->WikiPage->title).'__').$match[2].'">image</a>]</span>';
+				else {
+					$paramtxt = '';
+					$csstxt = '';
+					if(!empty($match[3])) {
+						preg_match_all('/([^=]+)=([^\&]+)/', $match[3], $param, PREG_SET_ORDER);
+						foreach($param as $pr) {
+							switch($pr[1]) {
+								case 'width':
+									if(preg_match('/^[0-9]+$/', $pr[2]))
+										$csstxt .= 'width: '.$pr[2].'px; ';
+									else
+										$csstxt .= 'width: '.$pr[2].'; ';
+									break;
+								case 'height':
+									if(preg_match('/^[0-9]+$/', $pr[2]))
+										$csstxt .= 'height: '.$pr[2].'px; ';
+									else
+										$csstxt .= 'height: '.$pr[2].'; ';
+									break;
+								case 'align':
+									if($pr[2]!='center')
+										$csstxt .= 'float: '.$pr[2].'; ';
+									break;
+								default:
+									$paramtxt.=' '.$pr[1].'="'.$pr[2].'"';
+							}
+						}
+					}
+					$paramtxt .= ($csstxt!=''?' style="'.$csstxt.'"':'');
+					$innerstr = '<img src="https://attachment.namu.wiki/'.($match[1]?($match[1]=='' || substr($match[1], 0, -1)==''?'':substr($match[1], 0, -1).'__'):rawurlencode($this->WikiPage->title).'__').$match[2].'"'.$paramtxt.'>';
+				}
+				$line = substr($line, 0, $j).$innerstr.substr($line, $j+strlen($match[0]));
+				$line_len = strlen($line);
+				$j+=strlen($innerstr)-1;
+				continue;
+			} else {
+				foreach($this->single_bracket as $bracket) {
+					$nj=$j;
+					if(self::startsWith($line, $bracket['open'], $j) && $innerstr = $this->bracketParser($line, $nj, $bracket)) {
+						$line = substr($line, 0, $j).$innerstr.substr($line, $nj+1);
+						$line_len = strlen($line);
+						$j+=strlen($innerstr)-1;
+						break;
+					}
 				}
 			}
 		}
@@ -601,12 +695,18 @@ class NamuMark {
 	}
 
 	private function renderProcessor($text, $type) {
-		if(self::startsWith($text, '#!html')) {
-			$html = substr($text, 7);
+		if(self::startsWithi($text, '#!html')) {
+			$html = substr($text, 6);
+			$html = ltrim($html);
 			$html = htmlspecialchars_decode($html);
-			return '<div>'.$html.'</div>';
+			$html = self::inlineHtml($html);
+			return $html;
 		}
 		return '<pre><code>'.substr($text, 1).'</code></pre>';
+	}
+
+	private function closureProcessor($text, $type) {
+		return '<div class="wiki-closure">'.$this->formatParser($text).'</div>';
 	}
 
 	private function linkProcessor($text, $type) {
@@ -614,16 +714,68 @@ class NamuMark {
 		if(preg_match('/^https?:\/\//', $href[0])) {
 			$targetUrl = $href[0];
 			$class = 'externalLink unnamed external';
-			$target = 'blank';
+			$target = '_blank';
+		}
+		elseif(preg_match('/^분류:(.+)$/', $href[0], $category)) {
+			array_push($this->links, array('target'=>$category[0], 'type'=>'category'));
+			if(!$this->included)
+				array_push($this->category, $category[1]);
+			return ' ';
+		}
+		elseif(preg_match('/^파일:(.+)$/', $href[0], $category)) {
+			array_push($this->links, array('target'=>$category[0], 'type'=>'file'));
+			if($this->imageAsLink)
+				return '<span class="alternative">[<a target="_blank" href="'.self::encodeURI($category[0]).'">image</a>]</span>';
+			
+			$paramtxt = '';
+			$csstxt = '';
+			if(!empty($href[1])) {
+				preg_match_all('/[&?]?([^=]+)=([^\&]+)/', htmlspecialchars_decode($href[1]), $param, PREG_SET_ORDER);
+				foreach($param as $pr) {
+					switch($pr[1]) {
+						case 'width':
+							if(preg_match('/^[0-9]+$/', $pr[2]))
+								$csstxt .= 'width: '.$pr[2].'px; ';
+							else
+								$csstxt .= 'width: '.$pr[2].'; ';
+							break;
+						case 'height':
+							if(preg_match('/^[0-9]+$/', $pr[2]))
+								$csstxt .= 'height: '.$pr[2].'px; ';
+							else
+								$csstxt .= 'height: '.$pr[2].'; ';
+							break;
+						case 'align':
+							if($pr[2]!='center')
+								$csstxt .= 'float: '.$pr[2].'; ';
+							break;
+						default:
+							$paramtxt.=' '.$pr[1].'="'.$pr[2].'"';
+					}
+				}
+			}
+			$paramtxt .= ($csstxt!=''?' style="'.$csstxt.'"':'');
+			return '<a href="'.$this->prefix.'/'.self::encodeURI($category[0]).'" title="'.htmlspecialchars($category[0]).'"><img src="https://namu.wiki/file/'.self::encodeURI($category[0]).'"'.$paramtxt.'></a>';
 		}
 		else {
-			$targetUrl = $this->prefix.'/'.rawurlencode($href[0]);
+			if(self::startsWith($href[0], ':')) {
+				$href[0] = substr($href[0], 1);
+				$c=1;
+			}
+			$targetUrl = $this->prefix.'/'.self::encodeURI($href[0]);
+			if($this->wapRender && !empty($href[1]))
+				$title = $href[0];
+			if(empty($c))
+				array_push($this->links, array('target'=>$href[0], 'type'=>'link'));
 		}
-		return '<a href="'.$targetUrl.'"'.(!empty($class)?' class="'.$class.'"':'').(!empty($target)?' target="'.$target.'"':'').'>'.(!empty($href[1])?$this->formatParser($href[1]):$href[0]).'</a>';
+		return '<a href="'.$targetUrl.'"'.(!empty($title)?' title="'.$title.'"':'').(!empty($class)?' class="'.$class.'"':'').(!empty($target)?' target="'.$target.'"':'').'>'.(!empty($href[1])?$this->formatParser($href[1]):$href[0]).'</a>';
 	}
 
 	private function macroProcessor($text, $type) {
-		switch(strtolower($text)) {
+		$macroName = strtolower($text);
+		if(!empty($this->macro_processors[$macroName]))
+			return $this->macro_processors[$macroName]();
+		switch($macroName) {
 			case 'br':
 				return '<br>';
 			case 'date':
@@ -635,15 +787,55 @@ class NamuMark {
 			case 'footnote':
 				return $this->printFootnote();
 			default:
-				if(self::startsWithi($text, 'include') && preg_match('/^include\((.+)\)$/i', $text, $include)) {
-					return $this->htmlScan($this->WikiPage->getPage($include[1])->text);
+				if(self::startsWithi($text, 'include') && preg_match('/^include\((.+)\)$/i', $text, $include) && $include = $include[1]) {
+					if($this->included)
+						return ' ';
+
+					$include = explode(',', $include);
+					array_push($this->links, array('target'=>$include[0], 'type'=>'include'));
+					if(($page = $this->WikiPage->getPage($include[0])) && !empty($page->text)) {
+						foreach($include as $var) {
+							$var = explode('=', ltrim($var));
+							if(empty($var[1]))
+								$var[1]='';
+							$page->text = str_replace('@'.$var[0].'@', $var[1], $page->text);
+						}
+						$child = new NamuMark($page);
+						$child->prefix = $this->prefix;
+						$child->imageAsLink = $this->imageAsLink;
+						$child->wapRender = $this->wapRender;
+						$child->included = true;
+						return $child->toHtml();
+					}
+					return ' ';
+				}
+				elseif(self::startsWith($text, 'youtube') && preg_match('/^youtube\((.+)\)$/', $text, $include) && $include = $include[1]) {
+					$include = explode(',', $include);
+					$var = array();
+					foreach($include as $v) {
+						$v = explode('=', $v);
+						if(empty($v[1]))
+							$v[1]='';
+						$var[$v[0]] = $v[1];
+					}
+					return '<iframe width="'.(!empty($var['width'])?$var['width']:'640').'" height="'.(!empty($var['height'])?$var['height']:'360').'" src="//www.youtube.com/embed/'.$include[0].'" frameborder="0" allowfullscreen></iframe>';
+				}
+				elseif(self::startsWith($text, 'nicovideo') && preg_match('/^nicovideo\((.+)\)$/', $text, $include) && $include = $include[1]) {
+					$include = explode(',', $include);
+					$var = array();
+					foreach($include as $v) {
+						$v = explode('=', $v);
+						if(empty($v[1]))
+							$v[1]='';
+						$var[$v[0]] = $v[1];
+					}
+					return '<iframe width="'.(!empty($var['width'])?$var['width']:'640').'" height="'.(!empty($var['height'])?$var['height']:'360').'" src="http://ext.nicovideo.jp/thumb_watch/'.$include[0].'?w='.(!empty($var['width'])?$var['width']:'640').'&h='.(!empty($var['height'])?$var['height']:'360').'" frameborder="0" allowfullscreen></iframe>';
 				}
 				elseif(self::startsWith($text, '*') && preg_match('/^\*([^ ]*)([ ].+)?$/', $text, $note)) {
 					$notetext = !empty($note[2])?$this->blockParser($note[2]):'';
 					$id = $this->fnInsert($this->fn, $notetext, $note[1]);
 					$preview = $notetext;
 					$preview = strip_tags($preview);
-					$preview = htmlspecialchars($preview);
 					$preview = str_replace('"', '\\"', $preview);
 					return '<a id="rfn-'.htmlspecialchars($id).'" class="wiki-fn" href="#fn-'.rawurlencode($id).'" title="'.$preview.'">['.($note[1]?$note[1]:$id).']</a>';
 				}
@@ -672,8 +864,11 @@ class NamuMark {
 				return '<sub>'.$text.'</sub>';
 			case '{{{':
 				if(self::startsWith($text, '#!html')) {
-					$html = substr($text, 7);
+					$html = substr($text, 6);
+					$html = ltrim($html);
 					$html = htmlspecialchars_decode($html);
+					$html = self::inlineHtml($html);
+#					echo $html;
 					return $html;
 				}
 				if(preg_match('/^#(?:([A-Fa-f0-9]{3}|[A-Fa-f0-9]{6})|([A-Za-z]+)) (.*)$/', $text, $color)) {
@@ -715,9 +910,10 @@ class NamuMark {
 	private function printFootnote() {
 		if(count($this->fn)==0)
 			return '';
-		$result = '<hr><ul>';
+
+		$result = $this->wapRender?'<hr>':'<hr><ol class="fn">';
 		foreach($this->fn as $k => $fn) {
-			$result .= '<li>';
+			$result .= $this->wapRender?'<p>':'<li>';
 			if($fn['count']>1) {
 				$result .= '['.$fn['id'].'] ';
 				for($i=0;$i<$fn['count'];$i++) {
@@ -727,9 +923,10 @@ class NamuMark {
 			else {
 				$result .= '<a id="fn-'.htmlspecialchars($fn['id']).'" href="#rfn-'.$fn['id'].'">['.$fn['id'].']</a> ';
 			}
-			$result .= $this->blockParser($fn['text']).'</li>';
+			$result .= $this->blockParser($fn['text'])
+								.($this->wapRender?'</p>':'</li>');
 		}
-		$result .= '</ul>';
+		$result .= $this->wapRender?'':'</ol>';
 		$this->fn = array();
 		return $result;
 	}
@@ -777,7 +974,7 @@ class NamuMark {
 			$this->hParse($this->WikiPage->text);
 			$result = ''
 				.'<div id="toc">'
-#					.'<h2>Contents</h2>'
+					.($this->wapRender!==false?'<h2>목차</h2>':'')
 					.$this->printToc($this->toc, 0)
 				.'</div>'
 				.'';
@@ -859,6 +1056,54 @@ class NamuMark {
 	}
 
 	private static function seekEndOfLine($text, $offset=0) {
-		return ($r=strpos($text, "\n", $offset))===false?strlen($text):$r;
+		return self::seekStr($text, "\n", $offset);
+	}
+
+	private static function seekStr($text, $str, $offset=0) {
+		if($offset >= strlen($text) || $offset < 0)
+			return strlen($text);
+		return ($r=strpos($text, $str, $offset))===false?strlen($text):$r;
+	}
+
+	private static function inlineHtml($html) {
+		$html = str_replace("\n", '', $html);
+		$html = preg_replace('/<\/?(?:object|param)[^>]*>/', '', $html);
+		$html = preg_replace('/<embed([^>]+)>/', '<iframe$1 frameborder="0"></iframe>', $html);
+		$html = preg_replace('/(<img[^>]*[ ]+src=[\'\"]?)(https?\:[^\'\"\s]+)([\'\"]?)/', '$1$2$3', $html);
+		return $html;
+	}
+
+	function encodeURI($str) {
+		return str_replace(array('%3A', '%2F', '%23', '%28', '%29'), array(':', '/', '#', '(', ')'), rawurlencode($str));
+	}
+}
+
+class HTMLElement {
+	public $tagName, $innerHTML, $attributes;
+	function __construct($tagname) {
+		$this->tagName = $tagname;
+		$this->innerHTML = null;
+		$this->attributes = array();
+		$this->style = array();
+	}
+
+	public function toString() {
+		$style = $attr = '';
+		if(!empty($this->style)) {
+			foreach($this->style as $key => $value) {
+				$value = str_replace('\\', '\\\\', $value);
+				$value = str_replace('"', '\\"', $value);
+				$style.=$key.':'.$value.';';
+			}
+			$this->attributes['style'] = substr($style, 0, -1);
+		}
+		if(!empty($this->attributes)) {
+			foreach($this->attributes as $key => $value) {
+				$value = str_replace('\\', '\\\\', $value);
+				$value = str_replace('"', '\\"', $value);
+				$attr.=' '.$key.'="'.$value.'"';
+			}
+		}
+		return '<'.$this->tagName.$attr.'>'.$this->innerHTML.'</'.$this->tagName.'>';
 	}
 }
